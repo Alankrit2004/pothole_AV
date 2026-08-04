@@ -1,0 +1,20 @@
+services:
+  pothole-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pothole-api:latest
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3

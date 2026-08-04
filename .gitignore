@@ -1,0 +1,24 @@
+# Secrets -- never commit real env values or password hashes
+.env
+app2_users.json
+
+# Runtime data
+uploads/
+outputs/
+
+# Model weights -- ship via a documented download/volume step, not git
+*.pt
+*.pt.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.log
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
