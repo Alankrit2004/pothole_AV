@@ -1,15 +1,36 @@
-# Pothole Detection API
+# Pothole Detection API — GPU
 
 Flask + YOLO (Ultralytics) service for pothole detection on images and video,
 with JWT auth, per-user video jobs, live MJPEG preview, and SSE progress
-events.
+events. This variant runs inference on an **NVIDIA GPU** (CUDA 12.8 + cuDNN).
 
 ## Requirements
 
+- An NVIDIA GPU supported by CUDA 12.8 (see
+  [NVIDIA support matrix](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities)).
+  Tested against a GTX 1660 (Turing, sm_75).
+- Host NVIDIA driver recent enough for CUDA 12.8. Check with `nvidia-smi`.
+- **NVIDIA Container Toolkit** installed on the host (`nvidia-ctk`, the
+  `nvidia` container runtime). This is the only GPU-related piece installed
+  on the host.
 - `best.pt` (Ultralytics detect checkpoint, class `Potholes`) in the project
   root, named exactly `best.pt`.
-- Docker, or Python 3.11+ with `ffmpeg` on PATH (used as a fallback H.264
-  remux step if the OpenCV build has no built-in H.264 encoder).
+
+## Why your host stays clean
+
+The Docker image is built from `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`,
+which contains **the complete CUDA runtime and cuDNN libraries inside the
+container**. Nothing is installed on your host:
+
+- No CUDA Toolkit, no cuDNN, no `nvcc`, no library or path changes on the
+  host machine — so your other NVIDIA apps/drivers can't be disturbed.
+- The host only exposes the **GPU driver** to the container through the
+  NVIDIA Container Toolkit (read-only passthrough), the same way it would
+  for any containerized GPU workload.
+
+This is the "isolated environment" for CUDA/cuDNN development: every tool and
+library you need for GPU inference lives in the image, versioned with it, and
+goes away when you delete the image.
 
 ## Configuration
 
@@ -26,32 +47,85 @@ Set `CORS_ORIGINS` to your frontend's origin(s) (comma-separated). Set
 otherwise a random one-time password is generated and logged on first
 startup, and can be rotated afterwards via `POST /auth/change-password`.
 
+The app trusts `X-Forwarded-For`/`X-Forwarded-Proto` from a reverse proxy in
+front of it (`ProxyFix`), so rate limits and auth logs see real client IPs.
+Deploy it only behind a proxy you control that sets these headers.
+
 ## Run with Docker (recommended)
 
 ```bash
 docker compose up --build
 ```
 
-This builds the image, mounts `uploads/` and `outputs/` as volumes so
-files survive container restarts, and starts gunicorn with the
+This builds the image (base ~2.9 GB + CUDA torch ~2.6 GB, so the first pull
+takes a while), requests all GPUs via the `nvidia` runtime, mounts
+`uploads/`/`outputs/` as named volumes, and starts gunicorn with the
 single-worker gthread config (required by the in-process job/queue design —
 do not scale workers without moving `VIDEO_JOBS`/`FSM` state to shared
 storage like Redis first).
 
+The service binds to **`127.0.0.1:5002`** by default (localhost-only, not on
+the LAN) so it can coexist with other apps on the same host. Change the
+`ports:` mapping in `docker-compose.yml` if 5002 is taken — the port is only
+a host-side mapping; the app itself always listens on 5000 inside the
+container.
+
+Alternative, plain `docker run`:
+
+```bash
+docker build -t pothole-gpu .
+docker run --gpus all -p 127.0.0.1:5002:5000 \
+  --env-file .env \
+  -v pothole_gpu_uploads:/app/uploads \
+  -v pothole_gpu_outputs:/app/outputs \
+  pothole-gpu
+```
+
+## Expose over Tailscale (optional)
+
+Because the app binds to localhost, reach it from your tailnet with
+`tailscale serve`, which proxies a tailnet port to a local port:
+
+```bash
+# Private tailnet only (any port you like):
+tailscale serve --bg --https=5002 http://127.0.0.1:5002
+
+# Public internet (Funnel) — only ports 443, 8443, 10000 are allowed:
+tailscale funnel --bg --https=8443 http://127.0.0.1:5002
+```
+
+You can run multiple `tailscale serve`/`funnel` commands at once for
+different local apps — each port on your tailnet address gets its own URL
+(e.g. `https://<machine>:5002/`), so this does not clash with another app
+already served on a different port. See `tailscale serve status` /
+`tailscale funnel status` to list them.
+
+## Verify the GPU is actually used
+
+```bash
+# Inside the container:
+docker compose exec pothole-gpu python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# Expect: True NVIDIA GeForce GTX 1660
+```
+
+Also, `/health` returns `{"data":{"model_loaded":true}}` — the YOLO model is
+loaded into CUDA memory at startup if a device is available.
+
 ## Run locally (development only)
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt   # requires a local CUDA-capable environment
 export $(cat .env | xargs)
-python app1.py
+python app.py
 ```
 
-This runs Flask's dev server with `debug=False` (see note in `app1.py` on
-why `debug=True` is never used outside local debugging). For anything
-resembling production, use gunicorn:
+This runs Flask's dev server with `debug=True` — for local development only.
+Never run this in production: the Werkzeug debugger is a remote-code-execution
+risk. Production runs via gunicorn (see Dockerfile), which bypasses `__main__`:
 
 ```bash
-gunicorn -w 1 --threads 8 -k gthread -b 0.0.0.0:5000 app1:app
+gunicorn -w 1 --threads 8 -k gthread -b 0.0.0.0:5000 app:app
 ```
 
 ## Response format
@@ -96,11 +170,6 @@ default `{"msg": "..."}` responses.
 All job- and output-scoped endpoints return `404` (not `403`) for
 resources you don't own, to avoid confirming another user's job/file
 exists.
-
-A ready-to-import Postman collection + environment
-(`Pothole_API.postman_collection.json`,
-`Pothole_API_local.postman_environment.json`) covers every endpoint above,
-with Login and Submit Video auto-saving `access_token`/`job_id` for you.
 
 ## Known limitations (accepted for now, documented per the readiness review)
 

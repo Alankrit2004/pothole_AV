@@ -1,0 +1,37 @@
+services:
+  pothole-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pothole-gpu:latest
+    ports:
+      # 127.0.0.1 binding: not exposed on the LAN, only reachable locally and
+      # through a tailscale serve/funnel or reverse proxy. Host port 5002
+      # because 5000/5001 are already used by the attendance stack.
+      - "127.0.0.1:5002:5000"
+    env_file:
+      - .env
+    volumes:
+      # Named volumes (not bind mounts): the container runs as uid 10001 and
+      # host-created ./uploads,./outputs dirs are root-owned on Linux, which
+      # would break writes. Named volumes are Docker-owned and writable.
+      - uploads:/app/uploads
+      - outputs:/app/outputs
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+
+volumes:
+  uploads:
+  outputs:

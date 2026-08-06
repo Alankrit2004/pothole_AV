@@ -16,6 +16,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 from ultralytics import YOLO
 from pathlib import Path
 from FSM import frame_manager
@@ -31,16 +32,7 @@ logger = logging.getLogger("pothole_api")
 
 
 # ---------------------------------------------------------------------------
-# Standard response envelope: every JSON response (except streaming
-# endpoints) uses {"status": "success"|"error", "message": ..., "data": ...}.
-# HTTP status codes are kept as-is alongside this -- "status" here refers to
-# the envelope's success/error field, not the HTTP status code.
-#
-# Use ONLY these helpers for JSON responses -- never call jsonify({...})
-# directly in a route. That's what let the duplicate-key ("status" set
-# twice in one dict), set-literal ({details} instead of {"data": details}),
-# and typo ("errmessageor") bugs slip in: hand-built dicts have no
-# structural guardrail against any of that.
+
 # ---------------------------------------------------------------------------
 def ok(data=None, message="", code=200):
     return jsonify({"status": "success", "message": message, "data": data}), code
@@ -72,6 +64,11 @@ app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=6)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB max upload (videos are bigger)
+
+# Trust X-Forwarded-For/-Proto/-Host from the reverse proxy in front of the
+# app so rate limiting and auth logging see real client IPs (not the proxy's).
+# Only expose this app behind a trusted proxy that sets these headers.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
 # ---------------------------------------------------------------------------
 # CORS -- frontend is a separate app. Allowlist origins from env, never "*"
@@ -290,6 +287,61 @@ def change_password():
 # Protected endpoints
 # ---------------------------------------------------------------------------
 
+@app.route("/predict", methods=["POST"])
+@jwt_required()
+def predict():
+    current_user = get_jwt_identity()
+
+    if "image" not in request.files:
+        return err("no image file provided (use form field 'image')", 400)
+
+    file = request.files["image"]
+    if file.filename == "":
+        return err("empty filename", 400)
+    if not allowed_file(file.filename):
+        return err(f"unsupported file type, allowed: {ALLOWED_EXT}", 400)
+
+    try:
+        conf_threshold = float(request.form.get("conf", 0.25))
+    except ValueError:
+        return err("conf must be a number", 400)
+
+    filename = secure_filename(file.filename)
+    unique_name = f"{uuid.uuid4().hex}_{filename}"
+    filepath = os.path.join(app.config["UPLOAD_FOLDER"], unique_name)
+    file.save(filepath)
+
+    try:
+        results = model.predict(source=filepath, conf=conf_threshold, verbose=False)
+        result = results[0]
+
+        detections = []
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            detections.append({
+                "class_id": cls_id,
+                "class_name": model.names[cls_id],
+                "confidence": round(float(box.conf[0]), 4),
+                "bbox_xyxy": [round(v, 2) for v in box.xyxy[0].tolist()],
+            })
+
+        annotated = result.plot()
+        output_name = f"annotated_{unique_name}"
+        output_path = os.path.join(OUTPUT_FOLDER, output_name)
+        cv2.imwrite(output_path, annotated)
+        with OUTPUT_OWNERS_LOCK:
+            OUTPUT_OWNERS[output_name] = current_user
+
+        return ok(data={
+            "num_potholes_detected": len(detections),
+            "detections": detections,
+            "annotated_image_url": f"/outputs/{output_name}",
+        }, message="prediction complete")
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
 def _remux_to_h264(output_path):
     """Fallback path when OpenCV's build has no H.264 encoder: re-encode the
     mp4v file to H.264 with ffmpeg so it's playable in-browser."""
@@ -320,10 +372,6 @@ def process_video_job(job_id, filepath, output_path, conf_threshold, frame_skip,
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Browsers can't play mp4v (MPEG-4 Part 2). Try H.264 (avc1) first;
-        # if the installed OpenCV build lacks an H.264 encoder, fall back to
-        # mp4v and remux to H.264 with ffmpeg after writing (openh264 in the
-        # Docker image provides the actual encode either way).
         fourcc = cv2.VideoWriter_fourcc(*"avc1")
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         needs_ffmpeg_remux = not writer.isOpened()
@@ -614,6 +662,7 @@ def get_output_image(filename):
         return err("file not found", 404)
     return send_from_directory(OUTPUT_FOLDER, safe_name)
 
+
 @app.route("/jobs/<job_id>/alerts/stream", methods=["GET"])
 @jwt_required()
 def alert_stream(job_id):
@@ -630,41 +679,143 @@ def alert_stream(job_id):
         return owner_error
 
     def generate():
-        yield (
-            "event: stream_started\n"
-            f"data: {json.dumps({'message': 'Alert stream started'})}\n\n"
-        )
+
+        # ---------------------------------------------------
+        # STREAM_CONNECTED
+        # ---------------------------------------------------
+        payload = {
+            "event_type": "STREAM_CONNECTED",
+            "data": {
+                "job_id": job_id
+            }
+        }
+
+        yield f"data: {json.dumps(payload)}\n\n"
+
+        # ---------------------------------------------------
+        # JOB_STARTED
+        # ---------------------------------------------------
+        payload = {
+            "event_type": "JOB_STARTED",
+            "data": {
+                "job_id": job_id
+            }
+        }
+
+        yield f"data: {json.dumps(payload)}\n\n"
+
         last_alert_count = 0
 
         while True:
+
             with VIDEO_JOBS_LOCK:
                 job = VIDEO_JOBS.get(job_id)
+
                 if job is None:
-                    yield (
-                        "event: error\n"
-                        f"data: {json.dumps({'message': 'job not found'})}\n\n"
-                    )
+                    payload = {
+                        "event_type": "ERROR",
+                        "data": {'message': 'Job not found'}
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
                     return
 
                 alerts = list(job.get("alerts", []))
                 status = job.get("status")
 
-            # Send only new alerts
+            # ---------------------------------------------------
+            # POT_HOLE_DETECTED
+            # ---------------------------------------------------
             if len(alerts) > last_alert_count:
+
                 for alert in alerts[last_alert_count:]:
-                    yield (
-                        "event: alert\n"
-                        f"data: {json.dumps(alert)}\n\n"
-                    )
+
+                    payload = {
+                        "event_type": "POT_HOLE_DETECTED",
+                        "data": alert
+                    }
+
+                    yield f"data: {json.dumps(payload)}\n\n"
 
                 last_alert_count = len(alerts)
 
-            # End stream when processing finishes
-            if status in ("completed", "failed", "cancelled"):
-                yield (
-                    "event: end\n"
-                    f"data: {json.dumps({'status': status})}\n\n"
-                )
+            # ---------------------------------------------------
+            # JOB_COMPLETED
+            # ---------------------------------------------------
+            if status == "completed":
+
+                payload = {
+                    "event_type": "JOB_COMPLETED",
+                    "data": {
+                        "job_id": job_id,
+                        "status": status,
+                        "total_unique_potholes": job.get("total_unique_potholes", 0)
+                    }
+                }
+
+                yield f"data: {json.dumps(payload)}\n\n"
+
+                # STREAM_END
+                payload = {
+                    "event_type": "STREAM_END",
+                    "data": {
+                        "job_id": job_id
+                    }
+                }
+
+                yield f"data: {json.dumps(payload)}\n\n"
+
+                return
+
+            # ---------------------------------------------------
+            # JOB_FAILED
+            # ---------------------------------------------------
+            elif status == "failed":
+                payload = {
+                    "event_type": "JOB_FAILED",
+                    "data": {
+                        "job_id": job_id,
+                        'error': job.get('error')
+                    }
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+
+
+                payload = {
+                    "event_type": "STREAM_END",
+                    "data": {
+                        "job_id": job_id
+                    }
+                }
+
+                yield f"data: {json.dumps(payload)}\n\n"
+
+                return
+
+            # ---------------------------------------------------
+            # JOB_CANCELLED
+            # ---------------------------------------------------
+            elif status == "cancelled":
+
+                payload = {
+                    "event_type": "JOB_CANCELLED",
+                    "data": {
+                        "job_id": job_id,
+                        "status": status,
+                        "total_unique_potholes": job.get("total_unique_potholes", 0)
+                    }
+                }
+
+                yield f"data: {json.dumps(payload)}\n\n"
+
+                payload = {
+                    "event_type": "STREAM_END",
+                    "data": {
+                        "job_id": job_id
+                    }
+                }
+
+                yield f"data: {json.dumps(payload)}\n\n"
+
                 return
 
             time.sleep(0.2)
@@ -930,10 +1081,12 @@ def _retention_sweep_loop():
 def _sweep_stale_jobs():
     now = time.time()
     with VIDEO_JOBS_LOCK:
+        # Remove any job older than JOB_TTL_SECONDS -- this covers finished
+        # jobs past the TTL as well as "processing" jobs whose worker thread
+        # died (a stuck job would otherwise stay in memory forever).
         stale_ids = [
             job_id for job_id, job in VIDEO_JOBS.items()
-            if job.get("status") in ("completed", "failed", "cancelled")
-            and (now - job.get("created_at", now)) > JOB_TTL_SECONDS
+            if (now - job.get("created_at", now)) > JOB_TTL_SECONDS
         ]
         for job_id in stale_ids:
             VIDEO_JOBS.pop(job_id, None)

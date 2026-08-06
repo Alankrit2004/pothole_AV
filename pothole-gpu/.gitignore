@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime data (contains password hashes + user uploads/outputs)
+app2_users.json
+uploads/
+outputs/
+
+# Models (large binary, keep only best.pt.zip)
+*.pt
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log

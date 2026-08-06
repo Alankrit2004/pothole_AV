@@ -1,0 +1,17 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# PyTorch CUDA 12.8 wheels -- pinned. GPU inference runs inside this
+# container; the host only provides the NVIDIA driver + container toolkit.
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128
+
+Flask==3.0.3
+flask-jwt-extended==4.6.0
+flask-cors==6.0.5
+flask-limiter==4.1.1
+gunicorn==25.0.3
+ultralytics==8.2.103
+opencv-python-headless==4.10.0.84
+Werkzeug==3.0.4
+lapx==0.5.11

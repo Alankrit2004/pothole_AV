@@ -9,8 +9,11 @@ services:
     env_file:
       - .env
     volumes:
-      - ./uploads:/app/uploads
-      - ./outputs:/app/outputs
+      # Named volumes (not bind mounts): the container runs as uid 10001 and
+      # host-created ./uploads,./outputs dirs are root-owned on Linux, which
+      # would break writes. Named volumes are Docker-owned and writable.
+      - uploads:/app/uploads
+      - outputs:/app/outputs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
@@ -18,3 +21,7 @@ services:
       timeout: 5s
       start_period: 30s
       retries: 3
+
+volumes:
+  uploads:
+  outputs:
